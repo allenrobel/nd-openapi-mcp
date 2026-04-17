@@ -7,7 +7,7 @@ access to Cisco's OpenAPI Schema for Nexus Dashboard 4.2
 
 ```bash
 cd $HOME/repos # Or wherever you keep your repositories
-git clone <this repo>
+git clone https://github.com/allenrobel/nd-openapi-mcp.git
 cd nd-openapi-mcp
 # python should be Python v3.14 or higher
 # Might work with v3.11 or higher, but you'll need to modify
