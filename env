@@ -1,0 +1,2 @@
+export ND_SCHEMA_DIR=$HOME/.claude/schemas
+export PYTHONPATH=$HOME/repos/nd-openapi-mcp/.venv/lib/python3.14/site-packages
