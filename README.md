@@ -3,7 +3,7 @@
 This repo contains an MCP server that provides lower-token
 access to Cisco's OpenAPI Schema for Nexus Dashboard 4.2
 
-Tested on macOS 26.4.1 (Tahoe)
+Tested on macOS 26.4.1 (Tahoe) with Python 3.14
 
 ## Installation
 
