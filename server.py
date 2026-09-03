@@ -763,6 +763,14 @@ UNVERSIONED = "unversioned"
 SPEC_SUFFIXES = {".json", ".yaml", ".yml"}
 
 
+DIFF_ITEM_CAP = 200
+
+
+def _endpoint_fingerprint(ep: EndpointInfo) -> str:
+    """Fingerprint the parts of an operation that matter for a diff: parameters, request body, responses (unresolved)."""
+    return _fingerprint({"parameters": ep.parameters, "requestBody": ep.request_body, "responses": ep.responses})
+
+
 def _version_sort_key(version: str) -> tuple[int, ...]:
     """
     # Summary
@@ -940,6 +948,99 @@ class VersionRegistry:
             if store._load_errors:  # pylint: disable=protected-access
                 errors[name] = list(store._load_errors)  # pylint: disable=protected-access
         return errors
+
+    def diff(self, from_version: str, to_version: str, tag: str | None = None, item_cap: int = DIFF_ITEM_CAP) -> str:
+        """
+        # Summary
+
+        Report endpoints and component schemas added, removed, or changed between two loaded versions. Endpoints are keyed by
+        `(METHOD, path)`, schemas by name; "changed" means the canonical-JSON fingerprint differs. `tag` restricts the endpoint section
+        (case-insensitive exact tag match); the schema section is never tag-scoped. Per-category item lines are capped at `item_cap`.
+
+        ## Raises
+
+        None
+        """
+        if from_version == to_version:
+            return f"ND {from_version}: nothing to compare (same version on both sides)."
+        from_store, from_msg = self.resolve(from_version)
+        if from_store is None:
+            return from_msg
+        to_store, to_msg = self.resolve(to_version)
+        if to_store is None:
+            return to_msg
+
+        def endpoint_map(store: OpenAPISchemaStore) -> dict[tuple[str, str], EndpointInfo]:
+            result: dict[tuple[str, str], EndpointInfo] = {}
+            for ep in store.endpoints:
+                if tag and not any(t.lower() == tag.lower() for t in ep.tags):
+                    continue
+                result[(ep.method, ep.path)] = ep
+            return result
+
+        a_eps = endpoint_map(from_store)
+        b_eps = endpoint_map(to_store)
+        ep_added = sorted(set(b_eps) - set(a_eps))
+        ep_removed = sorted(set(a_eps) - set(b_eps))
+        ep_changed = sorted(k for k in set(a_eps) & set(b_eps) if _endpoint_fingerprint(a_eps[k]) != _endpoint_fingerprint(b_eps[k]))
+
+        def schema_map(store: OpenAPISchemaStore) -> dict[tuple[str, str], SchemaInfo]:
+            return {(info.api, info.name): info for entries in store.schemas.values() for info in entries}
+
+        a_schemas = schema_map(from_store)
+        b_schemas = schema_map(to_store)
+        sc_added = sorted(set(b_schemas) - set(a_schemas))
+        sc_removed = sorted(set(a_schemas) - set(b_schemas))
+        sc_changed = sorted(k for k in set(a_schemas) & set(b_schemas) if _fingerprint(a_schemas[k].full_schema) != _fingerprint(b_schemas[k].full_schema))
+
+        lines = [f"ND {from_version} → {to_version}", ""]
+        lines.append(f"Endpoints: {len(ep_added)} added, {len(ep_removed)} removed, {len(ep_changed)} changed")
+        lines.extend(self._endpoint_lines(ep_added, ep_removed, ep_changed, a_eps, b_eps, item_cap))
+        lines.append("")
+        lines.append(f"Schemas: {len(sc_added)} added, {len(sc_removed)} removed, {len(sc_changed)} changed")
+        lines.extend(self._capped("+", sc_added, "added", item_cap))
+        lines.extend(self._capped("-", sc_removed, "removed", item_cap))
+        lines.extend(self._capped("~", sc_changed, "changed", item_cap))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _capped(prefix: str, keys: list[tuple[str, str]], category: str, item_cap: int) -> list[str]:
+        """Render `    <prefix> <name> [<api>]` lines for `(api, name)` keys, truncated to `item_cap` with a trailing `... N more <category>` line."""
+        lines = [f"    {prefix} {name} [{api}]" for api, name in keys[:item_cap]]
+        if len(keys) > item_cap:
+            lines.append(f"    ... {len(keys) - item_cap} more {category}")
+        return lines
+
+    @staticmethod
+    def _endpoint_lines(
+        added: list[tuple[str, str]],
+        removed: list[tuple[str, str]],
+        changed: list[tuple[str, str]],
+        a_eps: dict[tuple[str, str], EndpointInfo],
+        b_eps: dict[tuple[str, str], EndpointInfo],
+        item_cap: int,
+    ) -> list[str]:
+        """Group endpoint diff entries by their first tag, sorted by tag then method/path, honoring `item_cap` per category."""
+        entries: list[tuple[str, str, EndpointInfo, str]] = []  # (tag, prefix, ep, category)
+        overflow: dict[str, int] = {}
+        for prefix, keys, source, category in (("+", added, b_eps, "added"), ("-", removed, a_eps, "removed"), ("~", changed, b_eps, "changed")):
+            if len(keys) > item_cap:
+                overflow[category] = len(keys) - item_cap
+            for key in keys[:item_cap]:
+                ep = source[key]
+                entries.append((ep.tags[0] if ep.tags else "-", prefix, ep, category))
+
+        lines: list[str] = []
+        current_tag: str | None = None
+        for tag_name, prefix, ep, _category in sorted(entries, key=lambda e: (e[0].lower(), e[2].method, e[2].path)):
+            if tag_name != current_tag:
+                lines.append(f"  [{tag_name}]")
+                current_tag = tag_name
+            summary = f" — {ep.summary}" if ep.summary else ""
+            lines.append(f"    {prefix} {ep.method:<7} {ep.path}{summary}")
+        for category, count in overflow.items():
+            lines.append(f"    ... {count} more {category}")
+        return lines
 
     def store_for(self, version: str) -> OpenAPISchemaStore | None:
         """
@@ -1127,6 +1228,20 @@ def list_versions() -> str:
     return "\n".join(lines)
 
 
+def diff_versions(from_version: str, to_version: str, tag: str | None = None) -> str:
+    """Show what changed between two loaded ND releases: endpoints and schemas added, removed, or changed.
+
+    Output is grouped by tag like Cisco's per-release API changelog. Use `tag` to narrow the endpoint section
+    (e.g. 'Interfaces'); the schema section always covers the whole spec. Long categories are truncated with a
+    '... N more' line, so narrow by tag when you need every item.
+
+    - from_version: older release (e.g. '4.2.1')
+    - to_version: newer release (e.g. '4.3.1')
+    - tag: optional exact tag name to restrict endpoints
+    """
+    return registry.diff(from_version, to_version, tag=tag)
+
+
 TOOL_FUNCTIONS = (
     list_endpoints,
     get_endpoint,
@@ -1136,6 +1251,7 @@ TOOL_FUNCTIONS = (
     list_tags,
     get_api_info,
     list_versions,
+    diff_versions,
 )
 
 
