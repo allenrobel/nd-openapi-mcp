@@ -122,6 +122,7 @@ class OpenAPISchemaStore:
         self._all_components: dict[str, dict[str, Any]] = {}
         self.loaded_files: list[str] = []
         self._file_stats: dict[str, dict[str, int]] = {}
+        self._file_info: dict[str, dict[str, str]] = {}
         self._load_errors: list[str] = []
 
     def load(self) -> None:
@@ -307,6 +308,68 @@ class OpenAPISchemaStore:
             "endpoints": endpoint_count,
             "schemas": schema_count,
         }
+
+        info = spec.get("info", {}) if isinstance(spec.get("info"), dict) else {}
+        self._file_info[filename] = {
+            "title": str(info.get("title", "Unknown API")),
+            "version": str(info.get("version", "unknown")),
+        }
+
+    # ------------------------------------------------------------------
+    # Read-only accessors (used by VersionRegistry and diff)
+    # ------------------------------------------------------------------
+
+    @property
+    def file_versions(self) -> dict[str, str]:
+        """
+        # Summary
+
+        Map each loaded filename to that file's own `info.version` string.
+
+        ## Raises
+
+        None
+        """
+        return {name: meta["version"] for name, meta in self._file_info.items()}
+
+    @property
+    def file_titles(self) -> dict[str, str]:
+        """
+        # Summary
+
+        Map each loaded filename to that file's `info.title` string.
+
+        ## Raises
+
+        None
+        """
+        return {name: meta["title"] for name, meta in self._file_info.items()}
+
+    @property
+    def endpoints(self) -> list[EndpointInfo]:
+        """
+        # Summary
+
+        All loaded endpoint operations, in load order.
+
+        ## Raises
+
+        None
+        """
+        return self._endpoints
+
+    @property
+    def schemas(self) -> dict[str, SchemaInfo]:
+        """
+        # Summary
+
+        All loaded component schemas keyed by name.
+
+        ## Raises
+
+        None
+        """
+        return self._schemas
 
     # ------------------------------------------------------------------
     # $ref resolution
