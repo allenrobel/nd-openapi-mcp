@@ -23,6 +23,7 @@ and exposes tools to browse, search, and inspect endpoints and schemas.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -93,6 +94,24 @@ class SchemaInfo:
             return f"{self.name:<45} {type_str:<10} ({len(self.properties)} props: {props})"
         return f"{self.name:<45} {type_str:<10}"
 
+    @property
+    def api(self) -> str:
+        """Short API name derived from the source file stem, e.g. `manage.json` -> `manage`."""
+        return Path(self.source_file).stem
+
+
+def _fingerprint(obj: Any) -> str:
+    """
+    # Summary
+
+    SHA-256 of the canonical JSON form of `obj` (sorted keys), so two structurally equal objects hash the same.
+
+    ## Raises
+
+    None
+    """
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Schema store
@@ -116,10 +135,10 @@ class OpenAPISchemaStore:
         self._schema_dir = schema_dir
         self._endpoints: list[EndpointInfo] = []
         self._endpoints_by_path: dict[str, dict[str, EndpointInfo]] = {}
-        self._schemas: dict[str, SchemaInfo] = {}
+        self._schemas: dict[str, list[SchemaInfo]] = {}
         self._tags: dict[str, str] = {}
         self._api_info: dict[str, Any] = {}
-        self._all_components: dict[str, dict[str, Any]] = {}
+        self._components_by_file: dict[str, dict[str, dict[str, Any]]] = {}
         self.loaded_files: list[str] = []
         self._file_stats: dict[str, dict[str, int]] = {}
         self._file_info: dict[str, dict[str, str]] = {}
@@ -209,34 +228,29 @@ class OpenAPISchemaStore:
             if tag_name and tag_name not in self._tags:
                 self._tags[tag_name] = tag.get("description", "")
 
-        # Merge components
+        # Components are document-local (OpenAPI `#/...` refs never cross files), so keep them per file.
         components = spec.get("components", {})
+        file_components: dict[str, dict[str, Any]] = {}
         for comp_type, comp_items in components.items():
             if not isinstance(comp_items, dict):
                 continue
-            if comp_type not in self._all_components:
-                self._all_components[comp_type] = {}
-            for name, definition in comp_items.items():
-                if name in self._all_components[comp_type]:
-                    print(
-                        f"Warning: {comp_type}/{name} redefined in {filename} "
-                        f"(overwriting previous definition)",
-                        file=sys.stderr,
-                    )
-                self._all_components[comp_type][name] = definition
-
-                if comp_type == "schemas":
+            file_components[comp_type] = dict(comp_items)
+            if comp_type == "schemas":
+                for name, definition in comp_items.items():
                     schema_count += 1
-                    self._schemas[name] = SchemaInfo(
-                        name=name,
-                        schema_type=definition.get("type"),
-                        description=definition.get("description"),
-                        properties=list(definition.get("properties", {}).keys()),
-                        required=definition.get("required", []),
-                        enum_values=definition.get("enum", []),
-                        full_schema=definition,
-                        source_file=filename,
+                    self._schemas.setdefault(name, []).append(
+                        SchemaInfo(
+                            name=name,
+                            schema_type=definition.get("type") if isinstance(definition, dict) else None,
+                            description=definition.get("description") if isinstance(definition, dict) else None,
+                            properties=list(definition.get("properties", {}).keys()) if isinstance(definition, dict) else [],
+                            required=definition.get("required", []) if isinstance(definition, dict) else [],
+                            enum_values=definition.get("enum", []) if isinstance(definition, dict) else [],
+                            full_schema=definition,
+                            source_file=filename,
+                        )
                     )
+        self._components_by_file[filename] = file_components
 
         # Extract base path from servers[0].url (e.g. "https://{cluster}/api/v1/manage" -> "/api/v1/manage")
         base_path = ""
@@ -359,11 +373,11 @@ class OpenAPISchemaStore:
         return self._endpoints
 
     @property
-    def schemas(self) -> dict[str, SchemaInfo]:
+    def schemas(self) -> dict[str, list[SchemaInfo]]:
         """
         # Summary
 
-        All loaded component schemas keyed by name.
+        All loaded component schemas keyed by name; one entry per file that defines the name, in load order.
 
         ## Raises
 
@@ -381,6 +395,7 @@ class OpenAPISchemaStore:
         max_depth: int = 3,
         _current_depth: int = 0,
         _seen: frozenset[str] | None = None,
+        source_file: str | None = None,
     ) -> Any:
         """
         # Summary
@@ -389,7 +404,8 @@ class OpenAPISchemaStore:
 
         Replaces `{"$ref": "#/components/schemas/Foo"}` with the actual
         definition, up to `max_depth` levels deep. Detects cycles and
-        marks them with `_circular: true`.
+        marks them with `_circular: true`. Refs are resolved in the scope of `source_file`; when it is None the
+        first loaded file defining the name wins.
 
         ## Raises
 
@@ -411,7 +427,7 @@ class OpenAPISchemaStore:
                 if _current_depth >= max_depth:
                     return {"$ref": ref_str, "_truncated": True}
 
-                resolved = self._lookup_ref(ref_str)
+                resolved = self._lookup_ref(ref_str, source_file)
                 if resolved is None:
                     return {"$ref": ref_str, "_unresolved": True}
 
@@ -421,44 +437,51 @@ class OpenAPISchemaStore:
                     max_depth=max_depth,
                     _current_depth=_current_depth + 1,
                     _seen=new_seen,
+                    source_file=source_file,
                 )
 
             return {
-                k: self.resolve_refs(v, max_depth, _current_depth, _seen)
+                k: self.resolve_refs(v, max_depth, _current_depth, _seen, source_file=source_file)
                 for k, v in obj.items()
             }
 
         if isinstance(obj, list):
             return [
-                self.resolve_refs(item, max_depth, _current_depth, _seen)
+                self.resolve_refs(item, max_depth, _current_depth, _seen, source_file=source_file)
                 for item in obj
             ]
 
         return obj
 
-    def _lookup_ref(self, ref_str: str) -> dict[str, Any] | None:
+    def _lookup_ref(self, ref_str: str, source_file: str | None = None) -> dict[str, Any] | None:
         """
         # Summary
 
-        Resolve a JSON Pointer like `#/components/schemas/User`.
+        Resolve a JSON Pointer like `#/components/schemas/User` inside one file's components. With `source_file` None, search files in
+        load order and return the first hit.
 
         ## Raises
 
         None (returns None if not found)
         """
         parts = ref_str.lstrip("#/").split("/")
-
         if len(parts) < 2 or parts[0] != "components":
             return None
 
-        current: Any = self._all_components
-        for part in parts[1:]:
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                return None
-
-        return current if isinstance(current, dict) else None
+        files = [source_file] if source_file is not None else list(self.loaded_files)
+        for fname in files:
+            current: Any = self._components_by_file.get(fname)
+            if current is None:
+                continue
+            for part in parts[1:]:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    current = None
+                    break
+            if isinstance(current, dict):
+                return current
+        return None
 
     # ------------------------------------------------------------------
     # Query methods
@@ -535,9 +558,9 @@ class OpenAPISchemaStore:
             "summary": ep.summary,
             "description": ep.description,
             "tags": ep.tags,
-            "parameters": self.resolve_refs(ep.parameters, max_depth=ref_depth),
-            "request_body": self.resolve_refs(ep.request_body, max_depth=ref_depth) if ep.request_body else None,
-            "responses": self.resolve_refs(ep.responses, max_depth=ref_depth),
+            "parameters": self.resolve_refs(ep.parameters, max_depth=ref_depth, source_file=ep.source_file),
+            "request_body": self.resolve_refs(ep.request_body, max_depth=ref_depth, source_file=ep.source_file) if ep.request_body else None,
+            "responses": self.resolve_refs(ep.responses, max_depth=ref_depth, source_file=ep.source_file),
             "source_file": ep.source_file,
         }
 
@@ -593,58 +616,73 @@ class OpenAPISchemaStore:
         """
         # Summary
 
-        List component schema names with type and property preview.
+        List component schema names with type and property preview. Names defined in more than one file are suffixed with the
+        defining APIs, plus `(definitions differ)` when the definitions are not identical.
 
         ## Raises
 
         None
         """
-        schemas = sorted(self._schemas.values(), key=lambda s: s.name.lower())
-
+        names = sorted(self._schemas, key=str.lower)
         if name_filter:
             nf_lower = name_filter.lower()
-            schemas = [s for s in schemas if nf_lower in s.name.lower()]
-
-        if not schemas:
+            names = [n for n in names if nf_lower in n.lower()]
+        if not names:
             return "No schemas found matching the given filter."
 
-        lines = [s.one_line() for s in schemas]
-        lines.append(f"\n({len(schemas)} schema{'s' if len(schemas) != 1 else ''})")
+        lines = []
+        for name in names:
+            entries = self._schemas[name]
+            line = entries[0].one_line()
+            if len(entries) > 1:
+                apis = ", ".join(e.api for e in entries)
+                differ = len({_fingerprint(e.full_schema) for e in entries}) > 1
+                line += f" [{apis}]" + (" (definitions differ)" if differ else "")
+            lines.append(line)
+        lines.append(f"\n({len(names)} schema{'s' if len(names) != 1 else ''})")
         return "\n".join(lines)
 
-    def query_get_schema(self, name: str, ref_depth: int = 3) -> str:
+    def query_get_schema(self, name: str, ref_depth: int = 3, api: str | None = None) -> str:
         """
         # Summary
 
-        Get a specific schema definition by name with $refs resolved.
+        Get one schema definition with `$refs` resolved in its own file's scope. `api` (file stem such as `manage`) picks the definition
+        when the same name exists in several files; it is required only when those definitions differ.
 
         ## Raises
 
         None
         """
-        schema_info = self._schemas.get(name)
-
-        if not schema_info:
-            # Try case-insensitive match
-            for schema_name, info in self._schemas.items():
+        entries = self._schemas.get(name)
+        if not entries:
+            for schema_name, candidates in self._schemas.items():
                 if schema_name.lower() == name.lower():
-                    schema_info = info
+                    entries = candidates
                     break
+        if not entries:
+            return f'Schema "{name}" not found.\nUse list_schemas to see available schema names.'
 
-        if not schema_info:
-            return (
-                f'Schema "{name}" not found.\n'
-                f"Use list_schemas to see available schema names."
-            )
+        canonical = entries[0].name
+        if api is not None:
+            chosen = [e for e in entries if e.api.lower() == api.lower()]
+            if not chosen:
+                return f'Schema "{canonical}" is not defined in api "{api}". Defined in: {", ".join(e.api for e in entries)}'
+            entries = chosen
 
-        resolved = self.resolve_refs(schema_info.full_schema, max_depth=ref_depth)
+        if len(entries) > 1 and len({_fingerprint(e.full_schema) for e in entries}) > 1:
+            files = " and ".join(e.source_file for e in entries)
+            choices = " or ".join(f'api="{e.api}"' for e in entries)
+            return f'Schema "{canonical}" is defined differently in {files}. Call get_schema again with {choices}.'
 
-        result = {
-            "name": schema_info.name,
-            "source_file": schema_info.source_file,
-            "schema": resolved,
+        info = entries[0]
+        result: dict[str, Any] = {
+            "name": info.name,
+            "source_file": info.source_file,
+            "api": info.api,
+            "schema": self.resolve_refs(info.full_schema, max_depth=ref_depth, source_file=info.source_file),
         }
-
+        if len(entries) > 1:
+            result["also_defined_in"] = [e.api for e in entries[1:]]
         return json.dumps(result, indent=2, default=str)
 
     def query_list_tags(self) -> str:
