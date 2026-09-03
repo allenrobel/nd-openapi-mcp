@@ -720,11 +720,19 @@ class OpenAPISchemaStore:
 
         None
         """
-        lines = []
+        lines: list[str] = []
 
-        title = self._api_info.get("title", "Unknown API")
-        version = self._api_info.get("version", "unknown")
-        lines.append(f"API: {title} v{version}")
+        if self.loaded_files:
+            lines.append(f"Files: {len(self.loaded_files)}")
+            for fname in self.loaded_files:
+                stats = self._file_stats.get(fname, {})
+                meta = self._file_info.get(fname, {})
+                lines.append(
+                    f"  {fname:<16} {meta.get('title', 'Unknown API'):<32} v{meta.get('version', 'unknown'):<10} "
+                    f"({stats.get('endpoints', 0)} endpoints, {stats.get('schemas', 0)} schemas)"
+                )
+        else:
+            lines.append("No files loaded.")
 
         if "servers" in self._api_info:
             servers = self._api_info["servers"]
@@ -733,23 +741,6 @@ class OpenAPISchemaStore:
                 if urls:
                     lines.append(f"Servers: {', '.join(urls)}")
 
-        desc = self._api_info.get("description")
-        if desc:
-            short_desc = desc[:200] + "..." if len(desc) > 200 else desc
-            lines.append(f"Description: {short_desc}")
-
-        lines.append("")
-
-        if self.loaded_files:
-            lines.append(f"Loaded files: {len(self.loaded_files)}")
-            for fname in self.loaded_files:
-                stats = self._file_stats.get(fname, {})
-                ep_count = stats.get("endpoints", 0)
-                sc_count = stats.get("schemas", 0)
-                lines.append(f"  {fname} ({ep_count} endpoints, {sc_count} schemas)")
-        else:
-            lines.append("No files loaded.")
-
         if self._load_errors:
             lines.append("")
             lines.append("Load errors:")
@@ -757,7 +748,7 @@ class OpenAPISchemaStore:
                 lines.append(f"  - {err}")
 
         lines.append("")
-        lines.append(f"Total: {len(self._endpoints)} endpoints, {len(self._schemas)} schemas")
+        lines.append(f"Total: {len(self._endpoints)} endpoints, {len(self._schemas)} schema names")
         lines.append(f"Tags: {len(self._tags)}")
 
         return "\n".join(lines)
@@ -1106,7 +1097,8 @@ def get_api_info(version: str | None = None) -> str:
     store, key = registry.resolve(version)
     if store is None:
         return key
-    return f"{_header(key)}\n{store.query_get_api_info()}"
+    footer = f"Versions loaded: {', '.join(registry.versions)} (default: {registry.default_version})"
+    return f"{_header(key)}\n{store.query_get_api_info()}\n{footer}"
 
 
 def list_versions() -> str:

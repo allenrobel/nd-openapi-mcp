@@ -105,3 +105,14 @@ def test_list_versions_nothing_loaded(tmp_path: Path) -> None:
     out = server.list_versions()
     assert out.startswith("Loaded versions: 0")
     assert "No schema files" in out
+
+
+def test_get_api_info_lists_each_file_version(built) -> None:
+    out = built.get_api_info()
+    assert "infra.json" in out and "Nexus Dashboard Infra v1" in out and "1.0.050" in out
+    assert "manage.json" in out and "Nexus Dashboard Manage v1" in out and "1.0.100" in out
+    assert "API: Nexus Dashboard Infra v1" not in out  # old "first file wins" line is gone
+
+
+def test_get_api_info_versions_footer(built) -> None:
+    assert built.get_api_info().splitlines()[-1] == "Versions loaded: 1.0.0, 2.0.0 (default: 1.0.0)"
