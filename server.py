@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -760,6 +761,156 @@ class OpenAPISchemaStore:
         lines.append(f"Tags: {len(self._tags)}")
 
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Version registry
+# ---------------------------------------------------------------------------
+
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+UNVERSIONED = "unversioned"
+SPEC_SUFFIXES = {".json", ".yaml", ".yml"}
+
+
+def _version_sort_key(version: str) -> tuple[int, ...]:
+    """
+    # Summary
+
+    Sort key for ND release strings: numeric on each dotted component, so `4.10.1` sorts after `4.3.1`. Non-matching names sort first.
+
+    ## Raises
+
+    None
+    """
+    if VERSION_RE.match(version):
+        return tuple(int(part) for part in version.split("."))
+    return (-1,)
+
+
+def _warn(message: str) -> None:
+    """Print a warning to stderr (the MCP stdio transport owns stdout)."""
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+class VersionRegistry:
+    """
+    # Summary
+
+    Discover `<schema_dir>/<X.Y.Z>/` directories and own one `OpenAPISchemaStore` per version. Falls back to loading spec files
+    directly under `schema_dir` as the single version `unversioned` when no version directories exist.
+
+    ## Raises
+
+    None (problems are recorded in `registry_errors` and printed to stderr)
+    """
+
+    def __init__(self, schema_dir: str, default_version: str | None = None) -> None:
+        self._schema_dir = schema_dir
+        self._requested_default = default_version
+        self._stores: dict[str, OpenAPISchemaStore] = {}
+        self._registry_errors: list[str] = []
+        self._default: str | None = None
+
+    def load(self) -> None:
+        """
+        # Summary
+
+        Scan the schema directory, build a store per version directory (or one `unversioned` store for a flat layout), and pick the default.
+
+        ## Raises
+
+        None
+        """
+        root = Path(self._schema_dir)
+        if not root.is_dir():
+            self._record(f"Schema directory not found: {self._schema_dir}")
+            return
+
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+        subdirs = [p for p in entries if p.is_dir()]
+        flat_files = [p for p in entries if p.is_file() and p.suffix.lower() in SPEC_SUFFIXES]
+        versioned = [p for p in subdirs if VERSION_RE.match(p.name)]
+
+        for sub in subdirs:
+            if sub not in versioned:
+                _warn(f"Skipping {sub}: directory name is not an X.Y.Z release")
+
+        if versioned:
+            if flat_files:
+                _warn(f"Ignoring {len(flat_files)} spec file(s) directly under {self._schema_dir}; versioned subdirectories take precedence")
+            for sub in versioned:
+                store = OpenAPISchemaStore(str(sub))
+                store.load()
+                if store.loaded_files:
+                    self._stores[sub.name] = store
+                else:
+                    self._record(f"{sub.name}: no schema files loaded from {sub}")
+        elif flat_files:
+            store = OpenAPISchemaStore(str(root))
+            store.load()
+            if store.loaded_files:
+                self._stores[UNVERSIONED] = store
+            else:
+                self._record(f"No schema files loaded from {self._schema_dir}")
+        else:
+            self._record(f"No schema files or X.Y.Z version directories found in {self._schema_dir}")
+
+        self._default = self._pick_default()
+
+    def _record(self, message: str) -> None:
+        """Log and remember a registry-level problem."""
+        print(message, file=sys.stderr)
+        self._registry_errors.append(message)
+
+    def _pick_default(self) -> str | None:
+        """Return the requested default if loaded, else the highest loaded version, else None."""
+        if not self._stores:
+            return None
+        highest = self.versions[-1]
+        if self._requested_default is None:
+            return highest
+        if self._requested_default in self._stores:
+            return self._requested_default
+        self._record(f'ND_DEFAULT_VERSION="{self._requested_default}" is not loaded; falling back to {highest}')
+        return highest
+
+    @property
+    def versions(self) -> list[str]:
+        """
+        # Summary
+
+        Loaded version names in ascending release order.
+
+        ## Raises
+
+        None
+        """
+        return sorted(self._stores, key=_version_sort_key)
+
+    @property
+    def registry_errors(self) -> list[str]:
+        """
+        # Summary
+
+        Layout-level problems found during `load()` (missing directory, empty version directory, bad default).
+
+        ## Raises
+
+        None
+        """
+        return list(self._registry_errors)
+
+    def store_for(self, version: str) -> OpenAPISchemaStore | None:
+        """
+        # Summary
+
+        Return the store for an exact version name, or None.
+
+        ## Raises
+
+        None
+        """
+        return self._stores.get(version)
 
 
 # ---------------------------------------------------------------------------
