@@ -6,11 +6,10 @@
 # ]
 # ///
 """
-# ND 4.2 OpenAPI Schema MCP Server
+# ND OpenAPI Schema MCP Server
 
-Provides efficient, low-token-usage access to Cisco Nexus Dashboard 4.2
-OpenAPI specifications. Loads schema files from a configurable directory
-and exposes tools to browse, search, and inspect endpoints and schemas.
+Provides efficient, low-token-usage access to Cisco Nexus Dashboard OpenAPI specifications for one or more releases.
+Loads schema files from a configurable directory and exposes tools to browse, search, and inspect endpoints and schemas.
 
 ## Usage
 
@@ -20,6 +19,7 @@ and exposes tools to browse, search, and inspect endpoints and schemas.
 
 - `ND_SCHEMA_DIR` - Directory containing OpenAPI JSON/YAML files
   (default: `.claude/schemas` relative to cwd)
+- `ND_DEFAULT_VERSION` - Release used when a tool call omits `version` (default: highest loaded)
 """
 from __future__ import annotations
 
@@ -967,40 +967,28 @@ class VersionRegistry:
 # MCP server
 # ---------------------------------------------------------------------------
 
-schema_dir = os.environ.get("ND_SCHEMA_DIR", ".claude/schemas")
-if not os.path.isabs(schema_dir):
-    schema_dir = os.path.join(os.getcwd(), schema_dir)
-
-store = OpenAPISchemaStore(schema_dir)
-store.load()
-
-mcp = FastMCP(
-    name="nd-openapi",
-    instructions=(
-        "ND OpenAPI schema reference for Cisco Nexus Dashboard 4.2. "
-        "Use list_endpoints or search_endpoints to discover endpoints, "
-        "then get_endpoint for full details. Use list_schemas and get_schema "
-        "for data model definitions. All results have $refs resolved inline."
-    ),
+INSTRUCTIONS = (
+    "ND OpenAPI schema reference for Cisco Nexus Dashboard. Several ND releases may be loaded; every tool accepts an optional "
+    "`version` (e.g. '4.2.1') and answers from the configured default when it is omitted. Every result starts with a line "
+    "'ND <version>' naming the release that answered. Call list_versions to see what is loaded and which is the default, and "
+    "diff_versions to see what changed between two releases. Use list_endpoints or search_endpoints to discover endpoints, then "
+    "get_endpoint for full details. Use list_schemas and get_schema for data model definitions. All results have $refs resolved inline."
 )
 
-NO_SCHEMAS_MSG = (
-    f"No OpenAPI schemas loaded. Place .json, .yaml, or .yml files in: {schema_dir}"
-)
+# Replaced by build_server(); a placeholder so the tool functions can be imported and called in tests.
+registry = VersionRegistry(".", None)
 
 
-def _check_loaded() -> str | None:
-    """Return an error message if no schemas are loaded, else None."""
-    if not store.loaded_files:
-        return NO_SCHEMAS_MSG
-    return None
+def _header(version_key: str) -> str:
+    """Return the first line of every tool result."""
+    return f"ND {version_key}"
 
 
-@mcp.tool()
 def list_endpoints(
     tag: str | None = None,
     path_contains: str | None = None,
     method: str | None = None,
+    version: str | None = None,
 ) -> str:
     """List API endpoints. Returns compact one-line-per-endpoint format.
 
@@ -1008,18 +996,19 @@ def list_endpoints(
     - tag: exact tag name match
     - path_contains: substring match in the URL path
     - method: HTTP method (GET, POST, PUT, DELETE, PATCH)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_endpoints(tag=tag, path_contains=path_contains, method=method)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_endpoints(tag=tag, path_contains=path_contains, method=method)}"
 
 
-@mcp.tool()
 def get_endpoint(
     path: str,
     method: str,
     ref_depth: int = 3,
+    version: str | None = None,
 ) -> str:
     """Get full details of a specific API endpoint.
 
@@ -1029,17 +1018,18 @@ def get_endpoint(
     - path: API path (e.g. /api/v1/infra/aaa/localUsers/{loginId})
     - method: HTTP method (GET, POST, PUT, DELETE, PATCH)
     - ref_depth: max $ref resolution depth (0-10, default 3)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_get_endpoint(path=path, method=method, ref_depth=ref_depth)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_get_endpoint(path=path, method=method, ref_depth=ref_depth)}"
 
 
-@mcp.tool()
 def search_endpoints(
     query: str,
     max_results: int = 20,
+    version: str | None = None,
 ) -> str:
     """Search endpoints by keyword.
 
@@ -1048,63 +1038,122 @@ def search_endpoints(
 
     - query: search term
     - max_results: maximum results to return (1-100, default 20)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_search_endpoints(query=query, max_results=max_results)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_search_endpoints(query=query, max_results=max_results)}"
 
 
-@mcp.tool()
 def list_schemas(
     name_filter: str | None = None,
+    version: str | None = None,
 ) -> str:
     """List component/model schema names.
 
     Returns schema name, type, and property preview in compact format.
 
     - name_filter: optional substring filter on schema names
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_schemas(name_filter=name_filter)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_schemas(name_filter=name_filter)}"
 
 
-@mcp.tool()
 def get_schema(
     name: str,
     ref_depth: int = 3,
+    api: str | None = None,
+    version: str | None = None,
 ) -> str:
     """Get a component/model schema definition by name.
 
-    Returns the full schema with $ref references resolved inline.
-    Use list_schemas to find available names.
+    Returns the full schema with $ref references resolved inline, scoped to the
+    file that defines it. Use list_schemas to find available names; names listed
+    with "(definitions differ)" need `api` to pick one.
 
     - name: schema name (e.g. 'LocalUser')
     - ref_depth: max $ref resolution depth (0-10, default 3)
+    - api: which API file's definition to return when a name exists in several
+      ('analyze', 'infra', 'manage', 'onemanage'); optional otherwise
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_get_schema(name=name, ref_depth=ref_depth)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_get_schema(name=name, ref_depth=ref_depth, api=api)}"
 
 
-@mcp.tool()
-def list_tags() -> str:
-    """List all API tags with descriptions. Tags group related endpoints."""
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_tags()
+def list_tags(version: str | None = None) -> str:
+    """List all API tags with descriptions. Tags group related endpoints.
+
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
+    """
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_tags()}"
 
 
-@mcp.tool()
-def get_api_info() -> str:
-    """Get API metadata: title, version, servers, loaded schema files, and counts."""
-    return store.query_get_api_info()
+def get_api_info(version: str | None = None) -> str:
+    """Get API metadata for one loaded release: per-file titles and spec versions, servers, counts, and the list of loaded releases.
+
+    - version: ND release to describe (e.g. '4.2.1'); default when omitted
+    """
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_get_api_info()}"
+
+
+TOOL_FUNCTIONS = (
+    list_endpoints,
+    get_endpoint,
+    search_endpoints,
+    list_schemas,
+    get_schema,
+    list_tags,
+    get_api_info,
+)
+
+
+def build_server(schema_dir: str, default_version: str | None = None) -> FastMCP:
+    """
+    # Summary
+
+    Load the registry from `schema_dir`, install it as the module-level `registry`, and return a FastMCP instance with every tool registered.
+
+    ## Raises
+
+    None
+    """
+    global registry  # pylint: disable=global-statement
+    registry = VersionRegistry(schema_dir, default_version)
+    registry.load()
+    mcp = FastMCP(name="nd-openapi", instructions=INSTRUCTIONS)
+    for fn in TOOL_FUNCTIONS:
+        mcp.tool(fn)
+    return mcp
+
+
+def main() -> None:
+    """
+    # Summary
+
+    Entry point: read `ND_SCHEMA_DIR` / `ND_DEFAULT_VERSION`, build the server, and run it.
+
+    ## Raises
+
+    None
+    """
+    schema_dir = os.environ.get("ND_SCHEMA_DIR", ".claude/schemas")
+    if not os.path.isabs(schema_dir):
+        schema_dir = os.path.join(os.getcwd(), schema_dir)
+    build_server(schema_dir, os.environ.get("ND_DEFAULT_VERSION") or None).run(transport="streamable-http", host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
-    # mcp.run()
+    main()
