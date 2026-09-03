@@ -83,3 +83,25 @@ def test_nothing_loaded_message(tmp_path: Path) -> None:
 def test_build_server_returns_fastmcp(versioned_dir: Path) -> None:
     mcp = server.build_server(str(versioned_dir))
     assert mcp.name == "nd-openapi"
+
+
+def test_list_versions_rows(built) -> None:
+    out = built.list_versions()
+    lines = out.splitlines()
+    assert lines[0] == "Loaded versions: 2 (default: 1.0.0)"
+    assert any(l.startswith("* 1.0.0") and "manage.json=1.0.100" in l and "infra.json=1.0.050" in l for l in lines)
+    assert any(l.startswith("  2.0.0") and "manage.json=1.2.200" in l and "3 endpoints" in l and "4 schema names" in l for l in lines)
+
+
+def test_list_versions_reports_bad_default(versioned_dir: Path) -> None:
+    server.build_server(str(versioned_dir), default_version="7.7.7")
+    out = server.list_versions()
+    assert "default: 2.0.0" in out
+    assert "7.7.7" in out and "falling back" in out
+
+
+def test_list_versions_nothing_loaded(tmp_path: Path) -> None:
+    server.build_server(str(tmp_path))
+    out = server.list_versions()
+    assert out.startswith("Loaded versions: 0")
+    assert "No schema files" in out

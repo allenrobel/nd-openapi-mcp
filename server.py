@@ -1109,6 +1109,32 @@ def get_api_info(version: str | None = None) -> str:
     return f"{_header(key)}\n{store.query_get_api_info()}"
 
 
+def list_versions() -> str:
+    """List every loaded ND release, which one is the default, each file's own spec version, counts, and any load problems.
+
+    Call this first when the release matters. `*` marks the default used when `version` is omitted.
+    """
+    versions = registry.versions
+    default = registry.default_version
+    lines = [f"Loaded versions: {len(versions)} (default: {default if default else 'none'})"]
+    for name in versions:
+        store = registry.store_for(name)
+        if store is None:
+            continue
+        marker = "*" if name == default else " "
+        files = ", ".join(f"{fname}={ver}" for fname, ver in sorted(store.file_versions.items()))
+        lines.append(f"{marker} {name:<12} {len(store.endpoints)} endpoints, {len(store.schemas)} schema names  [{files}]")
+    errors = registry.load_errors()
+    if errors:
+        lines.append("")
+        lines.append("Load problems:")
+        for scope, messages in errors.items():
+            label = "registry" if scope == "__registry__" else scope
+            for message in messages:
+                lines.append(f"  [{label}] {message}")
+    return "\n".join(lines)
+
+
 TOOL_FUNCTIONS = (
     list_endpoints,
     get_endpoint,
@@ -1117,6 +1143,7 @@ TOOL_FUNCTIONS = (
     get_schema,
     list_tags,
     get_api_info,
+    list_versions,
 )
 
 
