@@ -1,0 +1,16 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Nexus Dashboard Infra v1", "version": "1.0.050"},
+  "servers": [{"url": "https://{cluster}/api/v1/infra"}],
+  "paths": {
+    "/health": {
+      "get": {"operationId": "getHealth", "summary": "Cluster health", "tags": ["Infra"],
+              "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Shared"}}}}}}
+    }
+  },
+  "components": {
+    "schemas": {
+      "Shared": {"type": "string", "description": "infra flavour"}
+    }
+  }
+}
