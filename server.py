@@ -900,6 +900,56 @@ class VersionRegistry:
         """
         return list(self._registry_errors)
 
+    @property
+    def default_version(self) -> str | None:
+        """
+        # Summary
+
+        Version used when a tool call omits `version`; None when nothing is loaded.
+
+        ## Raises
+
+        None
+        """
+        return self._default
+
+    def resolve(self, version: str | None) -> tuple[OpenAPISchemaStore | None, str]:
+        """
+        # Summary
+
+        Map an optional version name to a store. Returns `(store, version_key)` on success, or `(None, error_message)` when nothing is
+        loaded or the name is unknown.
+
+        ## Raises
+
+        None
+        """
+        if not self._stores or self._default is None:
+            return None, f"No OpenAPI schemas loaded. Place X.Y.Z version directories (or spec files) in: {self._schema_dir}"
+        key = version if version is not None else self._default
+        store = self._stores.get(key)
+        if store is None:
+            return None, f'Unknown version "{version}". Available: {", ".join(self.versions)} (default: {self._default})'
+        return store, key
+
+    def load_errors(self) -> dict[str, list[str]]:
+        """
+        # Summary
+
+        Problems recorded during load, keyed by version name plus `__registry__` for layout-level problems. Only non-empty lists are included.
+
+        ## Raises
+
+        None
+        """
+        errors: dict[str, list[str]] = {}
+        if self._registry_errors:
+            errors["__registry__"] = list(self._registry_errors)
+        for name, store in self._stores.items():
+            if store._load_errors:  # pylint: disable=protected-access
+                errors[name] = list(store._load_errors)  # pylint: disable=protected-access
+        return errors
+
     def store_for(self, version: str) -> OpenAPISchemaStore | None:
         """
         # Summary
