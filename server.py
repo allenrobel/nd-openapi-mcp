@@ -1031,11 +1031,12 @@ class VersionRegistry:
                 entries.append((ep.tags[0] if ep.tags else "-", prefix, ep, category))
 
         lines: list[str] = []
-        current_tag: str | None = None
+        current_key: str | None = None
         for tag_name, prefix, ep, _category in sorted(entries, key=lambda e: (e[0].lower(), e[2].method, e[2].path)):
-            if tag_name != current_tag:
+            tag_key = tag_name.lower()
+            if tag_key != current_key:
                 lines.append(f"  [{tag_name}]")
-                current_tag = tag_name
+                current_key = tag_key
             summary = f" — {ep.summary}" if ep.summary else ""
             lines.append(f"    {prefix} {ep.method:<7} {ep.path}{summary}")
         for category, count in overflow.items():

@@ -1,6 +1,8 @@
 """VersionRegistry.diff and the diff_versions tool."""
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -85,3 +87,33 @@ def test_diff_versions_tool(versioned_dir: Path) -> None:
     out = server.diff_versions("1.0.0", "2.0.0", tag="Widgets")
     assert out.splitlines()[0] == "ND 1.0.0 → 2.0.0"
     assert "widgetActions/modify" in out
+
+
+def test_tag_group_case_insensitive(versioned_dir: Path, tmp_path: Path) -> None:
+    """Mixed-case tags ('Widgets' vs 'widgets') that sort adjacent must produce exactly one group header."""
+    root = tmp_path / "versioned"
+    root.mkdir()
+    shutil.copytree(versioned_dir / "1.0.0", root / "1.0.0")
+    shutil.copytree(versioned_dir / "2.0.0", root / "2.0.0")
+
+    manage_path = root / "2.0.0" / "manage.json"
+    spec = json.loads(manage_path.read_text())
+    spec["paths"]["/widgetActions/modify"]["post"]["tags"] = ["widgets"]
+    manage_path.write_text(json.dumps(spec))
+
+    r = VersionRegistry(str(root), default_version="1.0.0")
+    r.load()
+    out = r.diff("1.0.0", "2.0.0")
+    lines = out.splitlines()
+
+    widgets_headers = [line for line in lines if line.strip().lower() == "[widgets]"]
+    assert len(widgets_headers) == 1
+
+    header_index = lines.index(widgets_headers[0])
+    group = []
+    for line in lines[header_index + 1 :]:
+        if line.startswith("  [") or line == "":
+            break
+        group.append(line)
+    assert any(line.startswith("    + POST") and "widgetActions/modify" in line for line in group)
+    assert any(line.startswith("    ~ POST") and line.rstrip().endswith("widgets — Create widgets") for line in group)
