@@ -69,6 +69,11 @@ def test_same_version(reg: VersionRegistry) -> None:
     assert reg.diff("1.0.0", "1.0.0") == "ND 1.0.0: nothing to compare (same version on both sides)."
 
 
+def test_same_unknown_version_is_rejected(reg: VersionRegistry) -> None:
+    out = reg.diff("9.9.9", "9.9.9")
+    assert out.startswith('Unknown version "9.9.9"')
+
+
 def test_unknown_version(reg: VersionRegistry) -> None:
     out = reg.diff("1.0.0", "3.0.0")
     assert out.startswith('Unknown version "3.0.0". Available: 1.0.0, 2.0.0')

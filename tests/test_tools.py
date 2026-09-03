@@ -98,6 +98,12 @@ def test_list_versions_reports_bad_default(versioned_dir: Path) -> None:
     out = server.list_versions()
     assert "default: 2.0.0" in out
     assert "7.7.7" in out and "falling back" in out
+    assert "Requested default (ND_DEFAULT_VERSION): 7.7.7 — not loaded, fell back to 2.0.0" in out
+
+
+def test_list_versions_reports_honoured_default(built) -> None:
+    out = built.list_versions()
+    assert "Requested default (ND_DEFAULT_VERSION): 1.0.0 — honoured" in out
 
 
 def test_list_versions_nothing_loaded(tmp_path: Path) -> None:
@@ -116,3 +122,13 @@ def test_get_api_info_lists_each_file_version(built) -> None:
 
 def test_get_api_info_versions_footer(built) -> None:
     assert built.get_api_info().splitlines()[-1] == "Versions loaded: 1.0.0, 2.0.0 (default: 1.0.0)"
+
+
+def test_get_api_info_lists_each_file_server(built) -> None:
+    out = built.get_api_info()
+    lines = out.splitlines()
+    infra_line = next(l for l in lines if l.strip().startswith("infra.json"))
+    manage_line = next(l for l in lines if l.strip().startswith("manage.json"))
+    assert "https://{cluster}/api/v1/infra" in infra_line
+    assert "https://{cluster}/api/v1/manage" in manage_line
+    assert not any(l.startswith("Servers:") for l in lines)

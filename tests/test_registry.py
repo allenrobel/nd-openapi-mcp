@@ -94,6 +94,17 @@ def test_resolve_none_uses_default(versioned_dir: Path) -> None:
     assert store is reg.store_for("1.0.0")
 
 
+def test_resolve_empty_string_uses_default(versioned_dir: Path) -> None:
+    reg = VersionRegistry(str(versioned_dir), default_version="1.0.0")
+    reg.load()
+    store, key = reg.resolve("")
+    assert key == "1.0.0"
+    assert store is reg.store_for("1.0.0")
+    store, key = reg.resolve("  ")
+    assert key == "1.0.0"
+    assert store is reg.store_for("1.0.0")
+
+
 def test_resolve_explicit(versioned_dir: Path) -> None:
     reg = VersionRegistry(str(versioned_dir), default_version="1.0.0")
     reg.load()

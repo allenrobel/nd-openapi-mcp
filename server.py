@@ -255,6 +255,7 @@ class OpenAPISchemaStore:
 
         # Extract base path from servers[0].url (e.g. "https://{cluster}/api/v1/manage" -> "/api/v1/manage")
         base_path = ""
+        server_url = ""
         servers = spec.get("servers", [])
         if servers and isinstance(servers, list):
             server_url = servers[0].get("url", "") if isinstance(servers[0], dict) else ""
@@ -328,6 +329,7 @@ class OpenAPISchemaStore:
         self._file_info[filename] = {
             "title": str(info.get("title", "Unknown API")),
             "version": str(info.get("version", "unknown")),
+            "server": server_url,
         }
 
     # ------------------------------------------------------------------
@@ -359,6 +361,19 @@ class OpenAPISchemaStore:
         None
         """
         return {name: meta["title"] for name, meta in self._file_info.items()}
+
+    @property
+    def load_errors(self) -> list[str]:
+        """
+        # Summary
+
+        Problems recorded while loading this store's files (missing directory, no spec files, per-file parse errors).
+
+        ## Raises
+
+        None
+        """
+        return list(self._load_errors)
 
     @property
     def endpoints(self) -> list[EndpointInfo]:
@@ -728,18 +743,11 @@ class OpenAPISchemaStore:
                 stats = self._file_stats.get(fname, {})
                 meta = self._file_info.get(fname, {})
                 lines.append(
-                    f"  {fname:<16} {meta.get('title', 'Unknown API'):<32} v{meta.get('version', 'unknown'):<10} "
-                    f"({stats.get('endpoints', 0)} endpoints, {stats.get('schemas', 0)} schemas)"
+                    f"  {fname:<16} {meta.get('title', 'Unknown API'):<34} v{meta.get('version', 'unknown'):<10} "
+                    f"{meta.get('server', ''):<40} ({stats.get('endpoints', 0)} endpoints, {stats.get('schemas', 0)} schemas)"
                 )
         else:
             lines.append("No files loaded.")
-
-        if "servers" in self._api_info:
-            servers = self._api_info["servers"]
-            if isinstance(servers, list):
-                urls = [s.get("url", "") for s in servers if isinstance(s, dict)]
-                if urls:
-                    lines.append(f"Servers: {', '.join(urls)}")
 
         if self._load_errors:
             lines.append("")
@@ -900,6 +908,19 @@ class VersionRegistry:
         return list(self._registry_errors)
 
     @property
+    def requested_default(self) -> str | None:
+        """
+        # Summary
+
+        The `ND_DEFAULT_VERSION` value passed to the constructor, unmodified; `None` when no default was requested.
+
+        ## Raises
+
+        None
+        """
+        return self._requested_default
+
+    @property
     def default_version(self) -> str | None:
         """
         # Summary
@@ -917,7 +938,7 @@ class VersionRegistry:
         # Summary
 
         Map an optional version name to a store. Returns `(store, version_key)` on success, or `(None, error_message)` when nothing is
-        loaded or the name is unknown.
+        loaded or the name is unknown. An empty or whitespace-only `version` is treated the same as `None` (unset).
 
         ## Raises
 
@@ -925,6 +946,7 @@ class VersionRegistry:
         """
         if not self._stores or self._default is None:
             return None, f"No OpenAPI schemas loaded. Place X.Y.Z version directories (or spec files) in: {self._schema_dir}"
+        version = version if version is None or version.strip() else None
         key = version if version is not None else self._default
         store = self._stores.get(key)
         if store is None:
@@ -945,8 +967,8 @@ class VersionRegistry:
         if self._registry_errors:
             errors["__registry__"] = list(self._registry_errors)
         for name, store in self._stores.items():
-            if store._load_errors:  # pylint: disable=protected-access
-                errors[name] = list(store._load_errors)  # pylint: disable=protected-access
+            if store.load_errors:
+                errors[name] = store.load_errors
         return errors
 
     def diff(self, from_version: str, to_version: str, tag: str | None = None, item_cap: int = DIFF_ITEM_CAP) -> str:
@@ -961,14 +983,14 @@ class VersionRegistry:
 
         None
         """
-        if from_version == to_version:
-            return f"ND {from_version}: nothing to compare (same version on both sides)."
         from_store, from_msg = self.resolve(from_version)
         if from_store is None:
             return from_msg
         to_store, to_msg = self.resolve(to_version)
         if to_store is None:
             return to_msg
+        if from_version == to_version:
+            return f"ND {from_version}: nothing to compare (same version on both sides)."
 
         def endpoint_map(store: OpenAPISchemaStore) -> dict[tuple[str, str], EndpointInfo]:
             result: dict[tuple[str, str], EndpointInfo] = {}
@@ -1211,6 +1233,12 @@ def list_versions() -> str:
     versions = registry.versions
     default = registry.default_version
     lines = [f"Loaded versions: {len(versions)} (default: {default if default else 'none'})"]
+    requested = registry.requested_default
+    if requested is not None:
+        if requested == default:
+            lines.append(f"Requested default (ND_DEFAULT_VERSION): {requested} — honoured")
+        else:
+            lines.append(f"Requested default (ND_DEFAULT_VERSION): {requested} — not loaded, fell back to {default}")
     for name in versions:
         store = registry.store_for(name)
         if store is None:

@@ -9,7 +9,7 @@ Tested on macOS 26.4.1 (Tahoe) with Python 3.14
 ## Installation
 
 ```bash
-cd $HOME/repos # Or wherever you keep your repositories
+mkdir -p $HOME/repos/mcp && cd $HOME/repos/mcp # Or wherever you keep your repositories
 git clone https://github.com/allenrobel/nd-openapi-mcp.git
 cd nd-openapi-mcp
 # python should be Python v3.14 or higher
@@ -58,29 +58,24 @@ uv run pytest -q
 
 Add the following (edited for your environment) to $HOME/.claude/mcp.json
 
-Note that it requires that uv was installed per above.
-
 ```json
 {
     "mcpServers": {
         "nd-openapi": {
-            "type": "stdio"
-            "command": "/Users/arobel/repos/nd-openapi-mcp/.venv/bin/uv",
-            "args": ["run", "/Users/arobel/repos/nd-openapi-mcp/server.py"],
-            "env": {
-                "ND_SCHEMA_DIR": "/Users/arobel/repos/mcp/nd-openapi-mcp/schemas",
-                "ND_DEFAULT_VERSION": "4.2.1",
-                "PYTHONPATH": ""
-            }
+            "type": "http",
+            "url": "http://<host>:8000/mcp"
         }
     }
 }
 ```
 
+The server itself is started separately (see "To use standalone" below): `ND_SCHEMA_DIR` and `ND_DEFAULT_VERSION`
+are set in the environment of that running process (e.g. via the `env` file), not in `mcp.json`.
+
 ## To use standalone
 
 1. Follow the steps in Installation above
-2. cd $HOME/repos/nd-openapi-mcp
+2. cd $HOME/repos/mcp/nd-openapi-mcp
 3. source .venv/bin/activate
 4. Edit env for your environment (see example below)
 5. source env
