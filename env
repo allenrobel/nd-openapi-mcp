@@ -1,2 +1,3 @@
-export ND_SCHEMA_DIR=$HOME/repos/nd-openapi-mcp/schemas
-export PYTHONPATH=$HOME/repos/nd-openapi-mcp/.venv/lib/python3.14/site-packages
+export ND_SCHEMA_DIR=$HOME/repos/mcp/nd-openapi-mcp/schemas
+export ND_DEFAULT_VERSION=4.2.1
+export PYTHONPATH=$HOME/repos/mcp/nd-openapi-mcp/.venv/lib/python3.14/site-packages

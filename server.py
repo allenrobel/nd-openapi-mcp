@@ -6,11 +6,10 @@
 # ]
 # ///
 """
-# ND 4.2 OpenAPI Schema MCP Server
+# ND OpenAPI Schema MCP Server
 
-Provides efficient, low-token-usage access to Cisco Nexus Dashboard 4.2
-OpenAPI specifications. Loads schema files from a configurable directory
-and exposes tools to browse, search, and inspect endpoints and schemas.
+Provides efficient, low-token-usage access to Cisco Nexus Dashboard OpenAPI specifications for one or more releases.
+Loads schema files from a configurable directory and exposes tools to browse, search, and inspect endpoints and schemas.
 
 ## Usage
 
@@ -20,11 +19,14 @@ and exposes tools to browse, search, and inspect endpoints and schemas.
 
 - `ND_SCHEMA_DIR` - Directory containing OpenAPI JSON/YAML files
   (default: `.claude/schemas` relative to cwd)
+- `ND_DEFAULT_VERSION` - Release used when a tool call omits `version` (default: highest loaded)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -93,6 +95,24 @@ class SchemaInfo:
             return f"{self.name:<45} {type_str:<10} ({len(self.properties)} props: {props})"
         return f"{self.name:<45} {type_str:<10}"
 
+    @property
+    def api(self) -> str:
+        """Short API name derived from the source file stem, e.g. `manage.json` -> `manage`."""
+        return Path(self.source_file).stem
+
+
+def _fingerprint(obj: Any) -> str:
+    """
+    # Summary
+
+    SHA-256 of the canonical JSON form of `obj` (sorted keys), so two structurally equal objects hash the same.
+
+    ## Raises
+
+    None
+    """
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Schema store
@@ -116,12 +136,13 @@ class OpenAPISchemaStore:
         self._schema_dir = schema_dir
         self._endpoints: list[EndpointInfo] = []
         self._endpoints_by_path: dict[str, dict[str, EndpointInfo]] = {}
-        self._schemas: dict[str, SchemaInfo] = {}
+        self._schemas: dict[str, list[SchemaInfo]] = {}
         self._tags: dict[str, str] = {}
         self._api_info: dict[str, Any] = {}
-        self._all_components: dict[str, dict[str, Any]] = {}
+        self._components_by_file: dict[str, dict[str, dict[str, Any]]] = {}
         self.loaded_files: list[str] = []
         self._file_stats: dict[str, dict[str, int]] = {}
+        self._file_info: dict[str, dict[str, str]] = {}
         self._load_errors: list[str] = []
 
     def load(self) -> None:
@@ -208,37 +229,33 @@ class OpenAPISchemaStore:
             if tag_name and tag_name not in self._tags:
                 self._tags[tag_name] = tag.get("description", "")
 
-        # Merge components
+        # Components are document-local (OpenAPI `#/...` refs never cross files), so keep them per file.
         components = spec.get("components", {})
+        file_components: dict[str, dict[str, Any]] = {}
         for comp_type, comp_items in components.items():
             if not isinstance(comp_items, dict):
                 continue
-            if comp_type not in self._all_components:
-                self._all_components[comp_type] = {}
-            for name, definition in comp_items.items():
-                if name in self._all_components[comp_type]:
-                    print(
-                        f"Warning: {comp_type}/{name} redefined in {filename} "
-                        f"(overwriting previous definition)",
-                        file=sys.stderr,
-                    )
-                self._all_components[comp_type][name] = definition
-
-                if comp_type == "schemas":
+            file_components[comp_type] = dict(comp_items)
+            if comp_type == "schemas":
+                for name, definition in comp_items.items():
                     schema_count += 1
-                    self._schemas[name] = SchemaInfo(
-                        name=name,
-                        schema_type=definition.get("type"),
-                        description=definition.get("description"),
-                        properties=list(definition.get("properties", {}).keys()),
-                        required=definition.get("required", []),
-                        enum_values=definition.get("enum", []),
-                        full_schema=definition,
-                        source_file=filename,
+                    self._schemas.setdefault(name, []).append(
+                        SchemaInfo(
+                            name=name,
+                            schema_type=definition.get("type") if isinstance(definition, dict) else None,
+                            description=definition.get("description") if isinstance(definition, dict) else None,
+                            properties=list(definition.get("properties", {}).keys()) if isinstance(definition, dict) else [],
+                            required=definition.get("required", []) if isinstance(definition, dict) else [],
+                            enum_values=definition.get("enum", []) if isinstance(definition, dict) else [],
+                            full_schema=definition,
+                            source_file=filename,
+                        )
                     )
+        self._components_by_file[filename] = file_components
 
         # Extract base path from servers[0].url (e.g. "https://{cluster}/api/v1/manage" -> "/api/v1/manage")
         base_path = ""
+        server_url = ""
         servers = spec.get("servers", [])
         if servers and isinstance(servers, list):
             server_url = servers[0].get("url", "") if isinstance(servers[0], dict) else ""
@@ -308,6 +325,82 @@ class OpenAPISchemaStore:
             "schemas": schema_count,
         }
 
+        info = spec.get("info", {}) if isinstance(spec.get("info"), dict) else {}
+        self._file_info[filename] = {
+            "title": str(info.get("title", "Unknown API")),
+            "version": str(info.get("version", "unknown")),
+            "server": server_url,
+        }
+
+    # ------------------------------------------------------------------
+    # Read-only accessors (used by VersionRegistry and diff)
+    # ------------------------------------------------------------------
+
+    @property
+    def file_versions(self) -> dict[str, str]:
+        """
+        # Summary
+
+        Map each loaded filename to that file's own `info.version` string.
+
+        ## Raises
+
+        None
+        """
+        return {name: meta["version"] for name, meta in self._file_info.items()}
+
+    @property
+    def file_titles(self) -> dict[str, str]:
+        """
+        # Summary
+
+        Map each loaded filename to that file's `info.title` string.
+
+        ## Raises
+
+        None
+        """
+        return {name: meta["title"] for name, meta in self._file_info.items()}
+
+    @property
+    def load_errors(self) -> list[str]:
+        """
+        # Summary
+
+        Problems recorded while loading this store's files (missing directory, no spec files, per-file parse errors).
+
+        ## Raises
+
+        None
+        """
+        return list(self._load_errors)
+
+    @property
+    def endpoints(self) -> list[EndpointInfo]:
+        """
+        # Summary
+
+        All loaded endpoint operations, in load order.
+
+        ## Raises
+
+        None
+        """
+        return self._endpoints
+
+    @property
+    def schemas(self) -> dict[str, list[SchemaInfo]]:
+        """
+        # Summary
+
+        All loaded component schemas keyed by name; one entry per file that defines the name, in load order.
+
+        ## Raises
+
+        None
+        """
+        return self._schemas
+
     # ------------------------------------------------------------------
     # $ref resolution
     # ------------------------------------------------------------------
@@ -318,6 +411,7 @@ class OpenAPISchemaStore:
         max_depth: int = 3,
         _current_depth: int = 0,
         _seen: frozenset[str] | None = None,
+        source_file: str | None = None,
     ) -> Any:
         """
         # Summary
@@ -326,7 +420,8 @@ class OpenAPISchemaStore:
 
         Replaces `{"$ref": "#/components/schemas/Foo"}` with the actual
         definition, up to `max_depth` levels deep. Detects cycles and
-        marks them with `_circular: true`.
+        marks them with `_circular: true`. Refs are resolved in the scope of `source_file`; when it is None the
+        first loaded file defining the name wins.
 
         ## Raises
 
@@ -348,7 +443,7 @@ class OpenAPISchemaStore:
                 if _current_depth >= max_depth:
                     return {"$ref": ref_str, "_truncated": True}
 
-                resolved = self._lookup_ref(ref_str)
+                resolved = self._lookup_ref(ref_str, source_file)
                 if resolved is None:
                     return {"$ref": ref_str, "_unresolved": True}
 
@@ -358,44 +453,51 @@ class OpenAPISchemaStore:
                     max_depth=max_depth,
                     _current_depth=_current_depth + 1,
                     _seen=new_seen,
+                    source_file=source_file,
                 )
 
             return {
-                k: self.resolve_refs(v, max_depth, _current_depth, _seen)
+                k: self.resolve_refs(v, max_depth, _current_depth, _seen, source_file=source_file)
                 for k, v in obj.items()
             }
 
         if isinstance(obj, list):
             return [
-                self.resolve_refs(item, max_depth, _current_depth, _seen)
+                self.resolve_refs(item, max_depth, _current_depth, _seen, source_file=source_file)
                 for item in obj
             ]
 
         return obj
 
-    def _lookup_ref(self, ref_str: str) -> dict[str, Any] | None:
+    def _lookup_ref(self, ref_str: str, source_file: str | None = None) -> dict[str, Any] | None:
         """
         # Summary
 
-        Resolve a JSON Pointer like `#/components/schemas/User`.
+        Resolve a JSON Pointer like `#/components/schemas/User` inside one file's components. With `source_file` None, search files in
+        load order and return the first hit.
 
         ## Raises
 
         None (returns None if not found)
         """
         parts = ref_str.lstrip("#/").split("/")
-
         if len(parts) < 2 or parts[0] != "components":
             return None
 
-        current: Any = self._all_components
-        for part in parts[1:]:
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                return None
-
-        return current if isinstance(current, dict) else None
+        files = [source_file] if source_file is not None else list(self.loaded_files)
+        for fname in files:
+            current: Any = self._components_by_file.get(fname)
+            if current is None:
+                continue
+            for part in parts[1:]:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    current = None
+                    break
+            if isinstance(current, dict):
+                return current
+        return None
 
     # ------------------------------------------------------------------
     # Query methods
@@ -472,9 +574,9 @@ class OpenAPISchemaStore:
             "summary": ep.summary,
             "description": ep.description,
             "tags": ep.tags,
-            "parameters": self.resolve_refs(ep.parameters, max_depth=ref_depth),
-            "request_body": self.resolve_refs(ep.request_body, max_depth=ref_depth) if ep.request_body else None,
-            "responses": self.resolve_refs(ep.responses, max_depth=ref_depth),
+            "parameters": self.resolve_refs(ep.parameters, max_depth=ref_depth, source_file=ep.source_file),
+            "request_body": self.resolve_refs(ep.request_body, max_depth=ref_depth, source_file=ep.source_file) if ep.request_body else None,
+            "responses": self.resolve_refs(ep.responses, max_depth=ref_depth, source_file=ep.source_file),
             "source_file": ep.source_file,
         }
 
@@ -530,58 +632,73 @@ class OpenAPISchemaStore:
         """
         # Summary
 
-        List component schema names with type and property preview.
+        List component schema names with type and property preview. Names defined in more than one file are suffixed with the
+        defining APIs, plus `(definitions differ)` when the definitions are not identical.
 
         ## Raises
 
         None
         """
-        schemas = sorted(self._schemas.values(), key=lambda s: s.name.lower())
-
+        names = sorted(self._schemas, key=str.lower)
         if name_filter:
             nf_lower = name_filter.lower()
-            schemas = [s for s in schemas if nf_lower in s.name.lower()]
-
-        if not schemas:
+            names = [n for n in names if nf_lower in n.lower()]
+        if not names:
             return "No schemas found matching the given filter."
 
-        lines = [s.one_line() for s in schemas]
-        lines.append(f"\n({len(schemas)} schema{'s' if len(schemas) != 1 else ''})")
+        lines = []
+        for name in names:
+            entries = self._schemas[name]
+            line = entries[0].one_line()
+            if len(entries) > 1:
+                apis = ", ".join(e.api for e in entries)
+                differ = len({_fingerprint(e.full_schema) for e in entries}) > 1
+                line += f" [{apis}]" + (" (definitions differ)" if differ else "")
+            lines.append(line)
+        lines.append(f"\n({len(names)} schema{'s' if len(names) != 1 else ''})")
         return "\n".join(lines)
 
-    def query_get_schema(self, name: str, ref_depth: int = 3) -> str:
+    def query_get_schema(self, name: str, ref_depth: int = 3, api: str | None = None) -> str:
         """
         # Summary
 
-        Get a specific schema definition by name with $refs resolved.
+        Get one schema definition with `$refs` resolved in its own file's scope. `api` (file stem such as `manage`) picks the definition
+        when the same name exists in several files; it is required only when those definitions differ.
 
         ## Raises
 
         None
         """
-        schema_info = self._schemas.get(name)
-
-        if not schema_info:
-            # Try case-insensitive match
-            for schema_name, info in self._schemas.items():
+        entries = self._schemas.get(name)
+        if not entries:
+            for schema_name, candidates in self._schemas.items():
                 if schema_name.lower() == name.lower():
-                    schema_info = info
+                    entries = candidates
                     break
+        if not entries:
+            return f'Schema "{name}" not found.\nUse list_schemas to see available schema names.'
 
-        if not schema_info:
-            return (
-                f'Schema "{name}" not found.\n'
-                f"Use list_schemas to see available schema names."
-            )
+        canonical = entries[0].name
+        if api is not None:
+            chosen = [e for e in entries if e.api.lower() == api.lower()]
+            if not chosen:
+                return f'Schema "{canonical}" is not defined in api "{api}". Defined in: {", ".join(e.api for e in entries)}'
+            entries = chosen
 
-        resolved = self.resolve_refs(schema_info.full_schema, max_depth=ref_depth)
+        if len(entries) > 1 and len({_fingerprint(e.full_schema) for e in entries}) > 1:
+            files = " and ".join(e.source_file for e in entries)
+            choices = " or ".join(f'api="{e.api}"' for e in entries)
+            return f'Schema "{canonical}" is defined differently in {files}. Call get_schema again with {choices}.'
 
-        result = {
-            "name": schema_info.name,
-            "source_file": schema_info.source_file,
-            "schema": resolved,
+        info = entries[0]
+        result: dict[str, Any] = {
+            "name": info.name,
+            "source_file": info.source_file,
+            "api": info.api,
+            "schema": self.resolve_refs(info.full_schema, max_depth=ref_depth, source_file=info.source_file),
         }
-
+        if len(entries) > 1:
+            result["also_defined_in"] = [e.api for e in entries[1:]]
         return json.dumps(result, indent=2, default=str)
 
     def query_list_tags(self) -> str:
@@ -618,33 +735,17 @@ class OpenAPISchemaStore:
 
         None
         """
-        lines = []
-
-        title = self._api_info.get("title", "Unknown API")
-        version = self._api_info.get("version", "unknown")
-        lines.append(f"API: {title} v{version}")
-
-        if "servers" in self._api_info:
-            servers = self._api_info["servers"]
-            if isinstance(servers, list):
-                urls = [s.get("url", "") for s in servers if isinstance(s, dict)]
-                if urls:
-                    lines.append(f"Servers: {', '.join(urls)}")
-
-        desc = self._api_info.get("description")
-        if desc:
-            short_desc = desc[:200] + "..." if len(desc) > 200 else desc
-            lines.append(f"Description: {short_desc}")
-
-        lines.append("")
+        lines: list[str] = []
 
         if self.loaded_files:
-            lines.append(f"Loaded files: {len(self.loaded_files)}")
+            lines.append(f"Files: {len(self.loaded_files)}")
             for fname in self.loaded_files:
                 stats = self._file_stats.get(fname, {})
-                ep_count = stats.get("endpoints", 0)
-                sc_count = stats.get("schemas", 0)
-                lines.append(f"  {fname} ({ep_count} endpoints, {sc_count} schemas)")
+                meta = self._file_info.get(fname, {})
+                lines.append(
+                    f"  {fname:<16} {meta.get('title', 'Unknown API'):<34} v{meta.get('version', 'unknown'):<10} "
+                    f"{meta.get('server', ''):<40} ({stats.get('endpoints', 0)} endpoints, {stats.get('schemas', 0)} schemas)"
+                )
         else:
             lines.append("No files loaded.")
 
@@ -655,50 +756,354 @@ class OpenAPISchemaStore:
                 lines.append(f"  - {err}")
 
         lines.append("")
-        lines.append(f"Total: {len(self._endpoints)} endpoints, {len(self._schemas)} schemas")
+        lines.append(f"Total: {len(self._endpoints)} endpoints, {len(self._schemas)} schema names")
         lines.append(f"Tags: {len(self._tags)}")
 
         return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
+# Version registry
+# ---------------------------------------------------------------------------
+
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+UNVERSIONED = "unversioned"
+SPEC_SUFFIXES = {".json", ".yaml", ".yml"}
+
+
+DIFF_ITEM_CAP = 200
+
+
+def _endpoint_fingerprint(ep: EndpointInfo) -> str:
+    """Fingerprint the parts of an operation that matter for a diff: parameters, request body, responses (unresolved)."""
+    return _fingerprint({"parameters": ep.parameters, "requestBody": ep.request_body, "responses": ep.responses})
+
+
+def _version_sort_key(version: str) -> tuple[int, ...]:
+    """
+    # Summary
+
+    Sort key for ND release strings: numeric on each dotted component, so `4.10.1` sorts after `4.3.1`. Non-matching names sort first.
+
+    ## Raises
+
+    None
+    """
+    if VERSION_RE.match(version):
+        return tuple(int(part) for part in version.split("."))
+    return (-1,)
+
+
+def _warn(message: str) -> None:
+    """Print a warning to stderr (the MCP stdio transport owns stdout)."""
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+class VersionRegistry:
+    """
+    # Summary
+
+    Discover `<schema_dir>/<X.Y.Z>/` directories and own one `OpenAPISchemaStore` per version. Falls back to loading spec files
+    directly under `schema_dir` as the single version `unversioned` when no version directories exist.
+
+    ## Raises
+
+    None (problems are recorded in `registry_errors` and printed to stderr)
+    """
+
+    def __init__(self, schema_dir: str, default_version: str | None = None) -> None:
+        self._schema_dir = schema_dir
+        self._requested_default = default_version
+        self._stores: dict[str, OpenAPISchemaStore] = {}
+        self._registry_errors: list[str] = []
+        self._default: str | None = None
+
+    def load(self) -> None:
+        """
+        # Summary
+
+        Scan the schema directory, build a store per version directory (or one `unversioned` store for a flat layout), and pick the default.
+
+        ## Raises
+
+        None
+        """
+        root = Path(self._schema_dir)
+        if not root.is_dir():
+            self._record(f"Schema directory not found: {self._schema_dir}")
+            return
+
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+        subdirs = [p for p in entries if p.is_dir()]
+        flat_files = [p for p in entries if p.is_file() and p.suffix.lower() in SPEC_SUFFIXES]
+        versioned = [p for p in subdirs if VERSION_RE.match(p.name)]
+
+        for sub in subdirs:
+            if sub not in versioned:
+                _warn(f"Skipping {sub}: directory name is not an X.Y.Z release")
+
+        if versioned:
+            if flat_files:
+                _warn(f"Ignoring {len(flat_files)} spec file(s) directly under {self._schema_dir}; versioned subdirectories take precedence")
+            for sub in versioned:
+                store = OpenAPISchemaStore(str(sub))
+                store.load()
+                if store.loaded_files:
+                    self._stores[sub.name] = store
+                else:
+                    self._record(f"{sub.name}: no schema files loaded from {sub}")
+        elif flat_files:
+            store = OpenAPISchemaStore(str(root))
+            store.load()
+            if store.loaded_files:
+                self._stores[UNVERSIONED] = store
+            else:
+                self._record(f"No schema files loaded from {self._schema_dir}")
+        else:
+            self._record(f"No schema files or X.Y.Z version directories found in {self._schema_dir}")
+
+        self._default = self._pick_default()
+
+    def _record(self, message: str) -> None:
+        """Log and remember a registry-level problem."""
+        print(message, file=sys.stderr)
+        self._registry_errors.append(message)
+
+    def _pick_default(self) -> str | None:
+        """Return the requested default if loaded, else the highest loaded version, else None."""
+        if not self._stores:
+            return None
+        highest = self.versions[-1]
+        if self._requested_default is None:
+            return highest
+        if self._requested_default in self._stores:
+            return self._requested_default
+        self._record(f'ND_DEFAULT_VERSION="{self._requested_default}" is not loaded; falling back to {highest}')
+        return highest
+
+    @property
+    def versions(self) -> list[str]:
+        """
+        # Summary
+
+        Loaded version names in ascending release order.
+
+        ## Raises
+
+        None
+        """
+        return sorted(self._stores, key=_version_sort_key)
+
+    @property
+    def registry_errors(self) -> list[str]:
+        """
+        # Summary
+
+        Layout-level problems found during `load()` (missing directory, empty version directory, bad default).
+
+        ## Raises
+
+        None
+        """
+        return list(self._registry_errors)
+
+    @property
+    def requested_default(self) -> str | None:
+        """
+        # Summary
+
+        The `ND_DEFAULT_VERSION` value passed to the constructor, unmodified; `None` when no default was requested.
+
+        ## Raises
+
+        None
+        """
+        return self._requested_default
+
+    @property
+    def default_version(self) -> str | None:
+        """
+        # Summary
+
+        Version used when a tool call omits `version`; None when nothing is loaded.
+
+        ## Raises
+
+        None
+        """
+        return self._default
+
+    def resolve(self, version: str | None) -> tuple[OpenAPISchemaStore | None, str]:
+        """
+        # Summary
+
+        Map an optional version name to a store. Returns `(store, version_key)` on success, or `(None, error_message)` when nothing is
+        loaded or the name is unknown. An empty or whitespace-only `version` is treated the same as `None` (unset).
+
+        ## Raises
+
+        None
+        """
+        if not self._stores or self._default is None:
+            return None, f"No OpenAPI schemas loaded. Place X.Y.Z version directories (or spec files) in: {self._schema_dir}"
+        version = version if version is None or version.strip() else None
+        key = version if version is not None else self._default
+        store = self._stores.get(key)
+        if store is None:
+            return None, f'Unknown version "{version}". Available: {", ".join(self.versions)} (default: {self._default})'
+        return store, key
+
+    def load_errors(self) -> dict[str, list[str]]:
+        """
+        # Summary
+
+        Problems recorded during load, keyed by version name plus `__registry__` for layout-level problems. Only non-empty lists are included.
+
+        ## Raises
+
+        None
+        """
+        errors: dict[str, list[str]] = {}
+        if self._registry_errors:
+            errors["__registry__"] = list(self._registry_errors)
+        for name, store in self._stores.items():
+            if store.load_errors:
+                errors[name] = store.load_errors
+        return errors
+
+    def diff(self, from_version: str, to_version: str, tag: str | None = None, item_cap: int = DIFF_ITEM_CAP) -> str:
+        """
+        # Summary
+
+        Report endpoints and component schemas added, removed, or changed between two loaded versions. Endpoints are keyed by
+        `(METHOD, path)`, schemas by name; "changed" means the canonical-JSON fingerprint differs. `tag` restricts the endpoint section
+        (case-insensitive exact tag match); the schema section is never tag-scoped. Per-category item lines are capped at `item_cap`.
+
+        ## Raises
+
+        None
+        """
+        from_store, from_msg = self.resolve(from_version)
+        if from_store is None:
+            return from_msg
+        to_store, to_msg = self.resolve(to_version)
+        if to_store is None:
+            return to_msg
+        if from_version == to_version:
+            return f"ND {from_version}: nothing to compare (same version on both sides)."
+
+        def endpoint_map(store: OpenAPISchemaStore) -> dict[tuple[str, str], EndpointInfo]:
+            result: dict[tuple[str, str], EndpointInfo] = {}
+            for ep in store.endpoints:
+                if tag and not any(t.lower() == tag.lower() for t in ep.tags):
+                    continue
+                result[(ep.method, ep.path)] = ep
+            return result
+
+        a_eps = endpoint_map(from_store)
+        b_eps = endpoint_map(to_store)
+        ep_added = sorted(set(b_eps) - set(a_eps))
+        ep_removed = sorted(set(a_eps) - set(b_eps))
+        ep_changed = sorted(k for k in set(a_eps) & set(b_eps) if _endpoint_fingerprint(a_eps[k]) != _endpoint_fingerprint(b_eps[k]))
+
+        def schema_map(store: OpenAPISchemaStore) -> dict[tuple[str, str], SchemaInfo]:
+            return {(info.api, info.name): info for entries in store.schemas.values() for info in entries}
+
+        a_schemas = schema_map(from_store)
+        b_schemas = schema_map(to_store)
+        sc_added = sorted(set(b_schemas) - set(a_schemas))
+        sc_removed = sorted(set(a_schemas) - set(b_schemas))
+        sc_changed = sorted(k for k in set(a_schemas) & set(b_schemas) if _fingerprint(a_schemas[k].full_schema) != _fingerprint(b_schemas[k].full_schema))
+
+        lines = [f"ND {from_version} → {to_version}", ""]
+        lines.append(f"Endpoints: {len(ep_added)} added, {len(ep_removed)} removed, {len(ep_changed)} changed")
+        lines.extend(self._endpoint_lines(ep_added, ep_removed, ep_changed, a_eps, b_eps, item_cap))
+        lines.append("")
+        lines.append(f"Schemas: {len(sc_added)} added, {len(sc_removed)} removed, {len(sc_changed)} changed")
+        lines.extend(self._capped("+", sc_added, "added", item_cap))
+        lines.extend(self._capped("-", sc_removed, "removed", item_cap))
+        lines.extend(self._capped("~", sc_changed, "changed", item_cap))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _capped(prefix: str, keys: list[tuple[str, str]], category: str, item_cap: int) -> list[str]:
+        """Render `    <prefix> <name> [<api>]` lines for `(api, name)` keys, truncated to `item_cap` with a trailing `... N more <category>` line."""
+        lines = [f"    {prefix} {name} [{api}]" for api, name in keys[:item_cap]]
+        if len(keys) > item_cap:
+            lines.append(f"    ... {len(keys) - item_cap} more {category}")
+        return lines
+
+    @staticmethod
+    def _endpoint_lines(
+        added: list[tuple[str, str]],
+        removed: list[tuple[str, str]],
+        changed: list[tuple[str, str]],
+        a_eps: dict[tuple[str, str], EndpointInfo],
+        b_eps: dict[tuple[str, str], EndpointInfo],
+        item_cap: int,
+    ) -> list[str]:
+        """Group endpoint diff entries by their first tag, sorted by tag then method/path, honoring `item_cap` per category."""
+        entries: list[tuple[str, str, EndpointInfo, str]] = []  # (tag, prefix, ep, category)
+        overflow: dict[str, int] = {}
+        for prefix, keys, source, category in (("+", added, b_eps, "added"), ("-", removed, a_eps, "removed"), ("~", changed, b_eps, "changed")):
+            if len(keys) > item_cap:
+                overflow[category] = len(keys) - item_cap
+            for key in keys[:item_cap]:
+                ep = source[key]
+                entries.append((ep.tags[0] if ep.tags else "-", prefix, ep, category))
+
+        lines: list[str] = []
+        current_key: str | None = None
+        for tag_name, prefix, ep, _category in sorted(entries, key=lambda e: (e[0].lower(), e[2].method, e[2].path)):
+            tag_key = tag_name.lower()
+            if tag_key != current_key:
+                lines.append(f"  [{tag_name}]")
+                current_key = tag_key
+            summary = f" — {ep.summary}" if ep.summary else ""
+            lines.append(f"    {prefix} {ep.method:<7} {ep.path}{summary}")
+        for category, count in overflow.items():
+            lines.append(f"    ... {count} more {category}")
+        return lines
+
+    def store_for(self, version: str) -> OpenAPISchemaStore | None:
+        """
+        # Summary
+
+        Return the store for an exact version name, or None.
+
+        ## Raises
+
+        None
+        """
+        return self._stores.get(version)
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
-schema_dir = os.environ.get("ND_SCHEMA_DIR", ".claude/schemas")
-if not os.path.isabs(schema_dir):
-    schema_dir = os.path.join(os.getcwd(), schema_dir)
-
-store = OpenAPISchemaStore(schema_dir)
-store.load()
-
-mcp = FastMCP(
-    name="nd-openapi",
-    instructions=(
-        "ND OpenAPI schema reference for Cisco Nexus Dashboard 4.2. "
-        "Use list_endpoints or search_endpoints to discover endpoints, "
-        "then get_endpoint for full details. Use list_schemas and get_schema "
-        "for data model definitions. All results have $refs resolved inline."
-    ),
+INSTRUCTIONS = (
+    "ND OpenAPI schema reference for Cisco Nexus Dashboard. Several ND releases may be loaded; every tool accepts an optional "
+    "`version` (e.g. '4.2.1') and answers from the configured default when it is omitted. Every result starts with a line "
+    "'ND <version>' naming the release that answered. Call list_versions to see what is loaded and which is the default, and "
+    "diff_versions to see what changed between two releases. Use list_endpoints or search_endpoints to discover endpoints, then "
+    "get_endpoint for full details. Use list_schemas and get_schema for data model definitions. All results have $refs resolved inline."
 )
 
-NO_SCHEMAS_MSG = (
-    f"No OpenAPI schemas loaded. Place .json, .yaml, or .yml files in: {schema_dir}"
-)
+# Replaced by build_server(); a placeholder so the tool functions can be imported and called in tests.
+registry = VersionRegistry(".", None)
 
 
-def _check_loaded() -> str | None:
-    """Return an error message if no schemas are loaded, else None."""
-    if not store.loaded_files:
-        return NO_SCHEMAS_MSG
-    return None
+def _header(version_key: str) -> str:
+    """Return the first line of every tool result."""
+    return f"ND {version_key}"
 
 
-@mcp.tool()
 def list_endpoints(
     tag: str | None = None,
     path_contains: str | None = None,
     method: str | None = None,
+    version: str | None = None,
 ) -> str:
     """List API endpoints. Returns compact one-line-per-endpoint format.
 
@@ -706,18 +1111,19 @@ def list_endpoints(
     - tag: exact tag name match
     - path_contains: substring match in the URL path
     - method: HTTP method (GET, POST, PUT, DELETE, PATCH)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_endpoints(tag=tag, path_contains=path_contains, method=method)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_endpoints(tag=tag, path_contains=path_contains, method=method)}"
 
 
-@mcp.tool()
 def get_endpoint(
     path: str,
     method: str,
     ref_depth: int = 3,
+    version: str | None = None,
 ) -> str:
     """Get full details of a specific API endpoint.
 
@@ -727,17 +1133,18 @@ def get_endpoint(
     - path: API path (e.g. /api/v1/infra/aaa/localUsers/{loginId})
     - method: HTTP method (GET, POST, PUT, DELETE, PATCH)
     - ref_depth: max $ref resolution depth (0-10, default 3)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_get_endpoint(path=path, method=method, ref_depth=ref_depth)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_get_endpoint(path=path, method=method, ref_depth=ref_depth)}"
 
 
-@mcp.tool()
 def search_endpoints(
     query: str,
     max_results: int = 20,
+    version: str | None = None,
 ) -> str:
     """Search endpoints by keyword.
 
@@ -746,63 +1153,171 @@ def search_endpoints(
 
     - query: search term
     - max_results: maximum results to return (1-100, default 20)
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_search_endpoints(query=query, max_results=max_results)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_search_endpoints(query=query, max_results=max_results)}"
 
 
-@mcp.tool()
 def list_schemas(
     name_filter: str | None = None,
+    version: str | None = None,
 ) -> str:
     """List component/model schema names.
 
     Returns schema name, type, and property preview in compact format.
 
     - name_filter: optional substring filter on schema names
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_schemas(name_filter=name_filter)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_schemas(name_filter=name_filter)}"
 
 
-@mcp.tool()
 def get_schema(
     name: str,
     ref_depth: int = 3,
+    api: str | None = None,
+    version: str | None = None,
 ) -> str:
     """Get a component/model schema definition by name.
 
-    Returns the full schema with $ref references resolved inline.
-    Use list_schemas to find available names.
+    Returns the full schema with $ref references resolved inline, scoped to the
+    file that defines it. Use list_schemas to find available names; names listed
+    with "(definitions differ)" need `api` to pick one.
 
     - name: schema name (e.g. 'LocalUser')
     - ref_depth: max $ref resolution depth (0-10, default 3)
+    - api: which API file's definition to return when a name exists in several
+      ('analyze', 'infra', 'manage', 'onemanage'); optional otherwise
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
     """
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_get_schema(name=name, ref_depth=ref_depth)
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_get_schema(name=name, ref_depth=ref_depth, api=api)}"
 
 
-@mcp.tool()
-def list_tags() -> str:
-    """List all API tags with descriptions. Tags group related endpoints."""
-    err = _check_loaded()
-    if err:
-        return err
-    return store.query_list_tags()
+def list_tags(version: str | None = None) -> str:
+    """List all API tags with descriptions. Tags group related endpoints.
+
+    - version: ND release to query (e.g. '4.2.1'); default when omitted
+    """
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    return f"{_header(key)}\n{store.query_list_tags()}"
 
 
-@mcp.tool()
-def get_api_info() -> str:
-    """Get API metadata: title, version, servers, loaded schema files, and counts."""
-    return store.query_get_api_info()
+def get_api_info(version: str | None = None) -> str:
+    """Get API metadata for one loaded release: per-file titles and spec versions, servers, counts, and the list of loaded releases.
+
+    - version: ND release to describe (e.g. '4.2.1'); default when omitted
+    """
+    store, key = registry.resolve(version)
+    if store is None:
+        return key
+    footer = f"Versions loaded: {', '.join(registry.versions)} (default: {registry.default_version})"
+    return f"{_header(key)}\n{store.query_get_api_info()}\n{footer}"
+
+
+def list_versions() -> str:
+    """List every loaded ND release, which one is the default, each file's own spec version, counts, and any load problems.
+
+    Call this first when the release matters. `*` marks the default used when `version` is omitted.
+    """
+    versions = registry.versions
+    default = registry.default_version
+    lines = [f"Loaded versions: {len(versions)} (default: {default if default else 'none'})"]
+    requested = registry.requested_default
+    if requested is not None:
+        if requested == default:
+            lines.append(f"Requested default (ND_DEFAULT_VERSION): {requested} — honoured")
+        else:
+            lines.append(f"Requested default (ND_DEFAULT_VERSION): {requested} — not loaded, fell back to {default}")
+    for name in versions:
+        store = registry.store_for(name)
+        if store is None:
+            continue
+        marker = "*" if name == default else " "
+        files = ", ".join(f"{fname}={ver}" for fname, ver in sorted(store.file_versions.items()))
+        lines.append(f"{marker} {name:<12} {len(store.endpoints)} endpoints, {len(store.schemas)} schema names  [{files}]")
+    errors = registry.load_errors()
+    if errors:
+        lines.append("")
+        lines.append("Load problems:")
+        for scope, messages in errors.items():
+            label = "registry" if scope == "__registry__" else scope
+            for message in messages:
+                lines.append(f"  [{label}] {message}")
+    return "\n".join(lines)
+
+
+def diff_versions(from_version: str, to_version: str, tag: str | None = None) -> str:
+    """Show what changed between two loaded ND releases: endpoints and schemas added, removed, or changed.
+
+    Output is grouped by tag like Cisco's per-release API changelog. Use `tag` to narrow the endpoint section
+    (e.g. 'Interfaces'); the schema section always covers the whole spec. Long categories are truncated with a
+    '... N more' line, so narrow by tag when you need every item.
+
+    - from_version: older release (e.g. '4.2.1')
+    - to_version: newer release (e.g. '4.3.1')
+    - tag: optional exact tag name to restrict endpoints
+    """
+    return registry.diff(from_version, to_version, tag=tag)
+
+
+TOOL_FUNCTIONS = (
+    list_endpoints,
+    get_endpoint,
+    search_endpoints,
+    list_schemas,
+    get_schema,
+    list_tags,
+    get_api_info,
+    list_versions,
+    diff_versions,
+)
+
+
+def build_server(schema_dir: str, default_version: str | None = None) -> FastMCP:
+    """
+    # Summary
+
+    Load the registry from `schema_dir`, install it as the module-level `registry`, and return a FastMCP instance with every tool registered.
+
+    ## Raises
+
+    None
+    """
+    global registry  # pylint: disable=global-statement
+    registry = VersionRegistry(schema_dir, default_version)
+    registry.load()
+    mcp = FastMCP(name="nd-openapi", instructions=INSTRUCTIONS)
+    for fn in TOOL_FUNCTIONS:
+        mcp.tool(fn)
+    return mcp
+
+
+def main() -> None:
+    """
+    # Summary
+
+    Entry point: read `ND_SCHEMA_DIR` / `ND_DEFAULT_VERSION`, build the server, and run it.
+
+    ## Raises
+
+    None
+    """
+    schema_dir = os.environ.get("ND_SCHEMA_DIR", ".claude/schemas")
+    if not os.path.isabs(schema_dir):
+        schema_dir = os.path.join(os.getcwd(), schema_dir)
+    build_server(schema_dir, os.environ.get("ND_DEFAULT_VERSION") or None).run(transport="streamable-http", host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
-    # mcp.run()
+    main()

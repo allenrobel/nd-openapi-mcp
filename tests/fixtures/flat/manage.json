@@ -1,0 +1,27 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Nexus Dashboard Manage v1", "version": "1.0.100", "description": "Fixture manage spec"},
+  "servers": [{"url": "https://{cluster}/api/v1/manage"}],
+  "tags": [{"name": "Widgets", "description": "Widget operations"}, {"name": "Legacy", "description": "Old stuff"}],
+  "paths": {
+    "/widgets": {
+      "get": {"operationId": "listWidgets", "summary": "List widgets", "tags": ["Widgets"],
+              "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Widget"}}}}}}},
+      "post": {"operationId": "createWidgets", "summary": "Create widgets", "tags": ["Widgets"],
+               "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}},
+               "responses": {"200": {"description": "OK"}}}
+    },
+    "/legacy": {
+      "get": {"operationId": "getLegacy", "summary": "Get legacy thing", "tags": ["Legacy"],
+              "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LegacyThing"}}}}}}
+    }
+  },
+  "components": {
+    "schemas": {
+      "Widget": {"type": "object", "description": "A widget", "properties": {"name": {"type": "string"}, "id": {"type": "integer"}}, "required": ["name"]},
+      "Stable": {"type": "object", "properties": {"value": {"type": "string"}}},
+      "LegacyThing": {"type": "object", "properties": {"old": {"type": "boolean"}}},
+      "Shared": {"type": "object", "description": "manage flavour", "properties": {"x": {"type": "integer"}}}
+    }
+  }
+}
